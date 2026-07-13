@@ -89,7 +89,7 @@ with st.sidebar:
     data_start_override   = st.number_input("Data start row override (0-based, -1 = auto)",
                                             value=-1, min_value=-1, step=1)
     sheet_input = st.text_input("Sheet name or index", value="0",
-                                help="Leave as 0 for the first sheet")
+                                help="Leave as 0 for the first sheet, or type the sheet name")
 
 prices = {
     "Au": au_price, "Ag": ag_price,
@@ -115,6 +115,24 @@ if uploaded is None:
     st.stop()
 
 
+# ── write upload to temp file (needed for openpyxl) ───────────────────────
+
+suffix = Path(uploaded.name).suffix
+with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    tmp.write(uploaded.read())
+    tmp_path = tmp.name
+
+# Show available sheets so user can pick the right one
+try:
+    import openpyxl as _opx
+    _wb = _opx.load_workbook(tmp_path, read_only=True, data_only=True)
+    sheet_names = _wb.sheetnames
+    _wb.close()
+    if len(sheet_names) > 1:
+        st.info(f"📋 **Sheets detected:** {', '.join(sheet_names)}  — use the Sheet field in Advanced to pick one.")
+except Exception:
+    sheet_names = []
+
 # ── run pipeline on upload ─────────────────────────────────────────────────
 
 hr   = None if header_row_override < 0 else int(header_row_override)
@@ -123,16 +141,17 @@ sht  = int(sheet_input) if sheet_input.strip().isdigit() else sheet_input.strip(
 
 with st.spinner("Reading and cleaning data…"):
     try:
-        # Write to a temp file so load_raw can use openpyxl
-        suffix = Path(uploaded.name).suffix
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
-
         raw_df     = load_raw(tmp_path, header_row=hr, data_start_row=dsr, sheet=sht)
         cleaned_df, _ = clean_dataframe(raw_df)
+    except ValueError as e:
+        st.error(f"**Data format error:** {e}")
+        st.caption("Try adjusting the Header row or Data start row in Advanced settings, or check the Sheet name.")
+        st.stop()
     except Exception as e:
-        st.error(f"Failed to load file: {e}")
+        st.error(f"**Failed to load file:** {e}")
+        with st.expander("Show full error"):
+            import traceback
+            st.code(traceback.format_exc())
         st.stop()
 
 elem_found = [e for e in prices if e in cleaned_df.columns]
