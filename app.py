@@ -96,7 +96,6 @@ prices = {
     "Pb": pb_price, "Zn": zn_price,
     "Cu": cu_price, "Ni": ni_price,
 }
-# Drop elements with zero price (user doesn't want them)
 prices = {k: v for k, v in prices.items() if v > 0}
 
 
@@ -122,7 +121,6 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
     tmp.write(uploaded.read())
     tmp_path = tmp.name
 
-# Show available sheets so user can pick the right one
 try:
     import openpyxl as _opx
     _wb = _opx.load_workbook(tmp_path, read_only=True, data_only=True)
@@ -133,7 +131,7 @@ try:
 except Exception:
     sheet_names = []
 
-# ── run pipeline on upload ─────────────────────────────────────────────────
+# ── run pipeline ───────────────────────────────────────────────────────────
 
 hr   = None if header_row_override < 0 else int(header_row_override)
 dsr  = None if data_start_override < 0 else int(data_start_override)
@@ -168,9 +166,6 @@ st.success(
     f"Elements found: {', '.join(elem_found)}"
 )
 
-
-# ── run interval finder whenever prices/cutoff change ─────────────────────
-
 with st.spinner("Finding best intervals…"):
     try:
         intervals = find_best_intervals(
@@ -183,9 +178,6 @@ with st.spinner("Finding best intervals…"):
         st.error(f"Interval finder error: {e}")
         st.stop()
 
-
-# ── results summary ────────────────────────────────────────────────────────
-
 n_holes = len(intervals)
 n_qual  = int((~intervals["no_intersection"]).sum()) if n_holes else 0
 
@@ -195,10 +187,6 @@ colB.metric("Qualifying Intervals",  n_qual)
 colC.metric("Below Cutoff",          n_holes - n_qual)
 
 st.divider()
-
-
-# ── results table ──────────────────────────────────────────────────────────
-
 st.subheader("Best Intervals")
 
 display_cols = ["Hole_ID", "From", "To", "Length_ft", "Length_m", "AuEq_avg"]
@@ -215,21 +203,19 @@ rename_map = {
 disp = intervals[[c for c in display_cols if c in intervals.columns]].copy()
 disp = disp.rename(columns=rename_map)
 
-# Fill "No significant intersections" text into From column for display
-ni_mask = intervals["no_intersection"].fillna(False).astype(bool)
-for col in ["From (ft)", "To (ft)", "Length (ft)", "Length (m)", "AuEq (g/t)",
-            "Value ($/t)"] + list(rename_map.values()):
-    if col in disp.columns:
-        disp.loc[ni_mask, col] = ""
-
-disp.loc[ni_mask, "From (ft)"] = "No significant intersections"
-
-# Format numbers
-num_cols = [c for c in disp.columns if disp[c].dtype in (float,) or
-            (disp[c].apply(lambda x: isinstance(x, float)).any())]
+# Format numbers FIRST (converts float cols to str, avoiding dtype conflict below)
 for c in disp.columns:
     if c not in ("Hole ID", "From (ft)"):
         disp[c] = disp[c].apply(lambda x: f"{x:.3f}" if isinstance(x, float) else x)
+
+# Now all columns are object dtype — safe to write empty strings
+ni_mask = intervals["no_intersection"].fillna(False).astype(bool)
+for col in disp.columns:
+    if col != "Hole ID":
+        disp[col] = disp[col].astype(object)
+        disp.loc[ni_mask, col] = ""
+
+disp.loc[ni_mask, "From (ft)"] = "No significant intersections"
 
 styled = (
     disp.style
@@ -240,17 +226,11 @@ styled = (
 )
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
-
-# ── raw data preview ───────────────────────────────────────────────────────
-
 with st.expander("Raw Data Preview (cleaned)", expanded=False):
     preview_cols = ["Hole_ID", "From", "To"] + elem_found
     preview = cleaned_df[[c for c in preview_cols if c in cleaned_df.columns]].copy()
-
-    # Add computed AuEq column for preview
     preview["AuEq (g/t)"] = compute_aueq_series(cleaned_df, prices, recovery=recovery).round(4)
 
-    # Highlight rows above cutoff
     def _highlight_raw(row):
         try:
             if float(row.get("AuEq (g/t)", 0)) >= cutoff:
@@ -262,13 +242,8 @@ with st.expander("Raw Data Preview (cleaned)", expanded=False):
     st.caption(f"{len(preview):,} rows · pink rows ≥ {cutoff} g/t AuEq")
     st.dataframe(
         preview.style.apply(_highlight_raw, axis=1),
-        use_container_width=True,
-        hide_index=True,
-        height=300,
+        use_container_width=True, hide_index=True, height=300,
     )
-
-
-# ── download ───────────────────────────────────────────────────────────────
 
 st.divider()
 st.subheader("Download Results")
