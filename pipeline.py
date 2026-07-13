@@ -122,6 +122,10 @@ def detect_header_row(raw: pd.DataFrame) -> tuple[int, int]:
 # 3. Load Excel file
 # ---------------------------------------------------------------------------
 
+_EXTRA_NA = ["", " ", "N/A", "n/a", "NA", "na", "#N/A", "-", "--",
+             "nd", "ND", "bdl", "BDL", "<dl>", "nil", "Nil", "NULL", "null", "none", "None"]
+
+
 def load_raw(
     filepath: str | Path,
     header_row: Optional[int] = None,
@@ -141,9 +145,14 @@ def load_raw(
     filepath = Path(filepath)
     raw = pd.read_excel(
         filepath, sheet_name=sheet,
-        header=None, dtype=str, keep_default_na=False,
+        header=None, dtype=object, keep_default_na=False,
+        na_values=_EXTRA_NA,
     )
-    raw.replace("", np.nan, inplace=True)
+    # Convert all cells to str or NaN — never leave raw numeric/date objects
+    raw = raw.map(lambda v: str(v).strip() if pd.notna(v) and str(v).strip() not in _EXTRA_NA else np.nan)
+    # Belt-and-suspenders: replace any remaining empty / whitespace-only strings
+    raw = raw.replace("", np.nan)
+    raw = raw.replace(r"^\s+$", np.nan, regex=True)
 
     if header_row is None:
         header_row, data_start_auto = detect_header_row(raw)
@@ -178,9 +187,18 @@ def clean_detection_limits(value):
     '>10000'  -> 10000.0
     Anything else is coerced to float or returned as-is.
     """
+    # Handle None / NaN / already-numeric values
+    if value is None:
+        return np.nan
+    if pd.isna(value) if not isinstance(value, (list, dict)) else False:
+        return np.nan
+    if isinstance(value, (int, float)):
+        return float(value) if not np.isnan(float(value)) else np.nan
     if not isinstance(value, str):
         return value
     s = value.strip()
+    if not s or s in _EXTRA_NA:
+        return np.nan
     m = _DL_LESS_THAN.match(s)
     if m:
         return 0.0
@@ -283,8 +301,8 @@ def apply_unit_conversions(
             else:
                 factor = 1.0   # already %
 
-        if factor != 1.0:
-            df[new_col] = pd.to_numeric(df[new_col], errors="coerce") * factor
+        series = pd.to_numeric(df[new_col], errors="coerce")
+        df[new_col] = series * factor if factor != 1.0 else series
 
     return df
 
@@ -377,16 +395,30 @@ def clean_dataframe(df: pd.DataFrame):
     Run the full cleaning pipeline on a raw DataFrame.
     Returns (cleaned_df, col_map).
     """
+    # Extra safety: flush any remaining empty/whitespace strings to NaN before map
+    df = df.replace("", np.nan)
+    df = df.replace(r"^\s+$", np.nan, regex=True)
+
     df = df.map(clean_detection_limits)
+
+    # Flush again after map in case any '' slipped through
+    df = df.replace("", np.nan)
+
     df, col_map, raw_units = standardise_columns(df)
     df = apply_unit_conversions(df, raw_units, col_map)
     df = parse_hole_depth_columns(df)
 
-    for col in [c for c in df.columns if c in _ELEMENT_ALIASES.values()]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Force ALL element symbol columns to numeric (coerce bad values to NaN)
+    for col in df.columns:
+        if col in set(_ELEMENT_ALIASES.values()):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df.dropna(subset=["From", "To"], how="all", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    # Also force From / To to numeric
+    for col in ("From", "To"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df[~(df["From"].isna() & df["To"].isna())].reset_index(drop=True)
     return df, col_map
 
 
@@ -940,24 +972,6 @@ def run_pipeline(
 ) -> Path:
     """
     Full pipeline: raw Excel -> cleaned data -> intervals -> output Excel.
-
-    Parameters
-    ----------
-    filepath       : path to input assay Excel file
-    prices         : {"Au": 1950, "Ag": 24, "Pb": 0.95, "Zn": 1.20}
-                     Precious metals in USD/troy oz, base metals in USD/lb
-    cutoff         : AuEq g/t cut-off for qualifying intervals
-    output_path    : where to save the output .xlsx
-    header_row     : override auto-detection (0-based)
-    data_start_row : override auto-detection (0-based)
-    sheet          : sheet index or name in the input file
-    drop_tolerance : fraction below cutoff allowed inside an interval
-    min_length_ft  : minimum qualifying interval length in feet
-    recovery       : metallurgical recovery for base metals (default 0.75)
-
-    Returns
-    -------
-    Path to the written output file.
     """
     print(f"[1/4] Loading {filepath} ...")
     raw_df = load_raw(filepath, header_row=header_row,
@@ -1005,20 +1019,13 @@ if __name__ == "__main__":
         default='{"Au": 1950, "Ag": 24, "Pb": 0.95, "Zn": 1.20}',
         help="JSON dict of metal prices e.g. '{\"Au\":1950,\"Ag\":24}'",
     )
-    parser.add_argument("--cutoff",     type=float, default=0.5,
-                        help="AuEq g/t cutoff (default 0.5)")
-    parser.add_argument("--header-row", type=int,   default=None,
-                        help="Override header row (0-based)")
-    parser.add_argument("--data-start", type=int,   default=None,
-                        help="Override data start row (0-based)")
-    parser.add_argument("--sheet",      default="0",
-                        help="Sheet index or name (default 0)")
-    parser.add_argument("--drop-tol",   type=float, default=0.5,
-                        help="Drop tolerance fraction (default 0.5)")
-    parser.add_argument("--min-length", type=float, default=10.0,
-                        help="Minimum interval length in feet (default 10)")
-    parser.add_argument("--recovery",   type=float, default=0.75,
-                        help="Base metal metallurgical recovery (default 0.75)")
+    parser.add_argument("--cutoff",     type=float, default=0.5)
+    parser.add_argument("--header-row", type=int,   default=None)
+    parser.add_argument("--data-start", type=int,   default=None)
+    parser.add_argument("--sheet",      default="0")
+    parser.add_argument("--drop-tol",   type=float, default=0.5)
+    parser.add_argument("--min-length", type=float, default=10.0)
+    parser.add_argument("--recovery",   type=float, default=0.75)
 
     args = parser.parse_args()
     prices_in = json.loads(args.prices)
