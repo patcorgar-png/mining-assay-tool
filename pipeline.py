@@ -942,7 +942,8 @@ def write_excel(
     Write the full Excel workbook with Results and Raw Data sheets.
     Returns the output path.
     """
-    output_path = Path(output_path)
+    if not hasattr(output_path, "write"):
+        output_path = Path(output_path)
     wb = openpyxl.Workbook()
     param_cells: dict[str, str] = {}
 
