@@ -218,7 +218,8 @@ def clean_detection_limits(value):
 
 _UNIT_ALIASES = {u.lower(): u.lower() for u in _UNIT_CONVERSIONS}
 
-# Matches "(ppm)", "(g/t)" OR suffix forms: "Pb_ppm", "Zn ppm"
+# Matches units in parentheses like "(ppm)" or "(g/t)", OR as a suffix
+# after space/underscore/dash/end-of-string: "Pb ppm", "Pb_ppm", "Au_g/t"
 _UNIT_RE = re.compile(
     r"[\(\s_\-](" + "|".join(re.escape(u) for u in _UNIT_CONVERSIONS) + r")[\)\s]?$",
     re.IGNORECASE,
@@ -226,13 +227,21 @@ _UNIT_RE = re.compile(
 
 
 def extract_units_from_columns(columns: list[str]) -> dict[str, str]:
-    """Parse units from headers: 'Au (g/t)', 'Pb_ppm', 'Zn ppm', 'Ag (oz/t)'."""
+    """
+    Parse units embedded in column headers.
+    Handles: 'Au (g/t)', 'Pb_ppm', 'Zn ppm', 'Ag (oz/t)'.
+    """
     result = {}
     for col in columns:
         m = _UNIT_RE.search(col)
         if m:
             result[col] = m.group(1).lower()
     return result
+
+
+# ---------------------------------------------------------------------------
+# 6. Column-name standardisation
+# ---------------------------------------------------------------------------
 
 def _parse_col_to_element(col: str) -> Optional[str]:
     base = _UNIT_RE.sub("", col).strip().lower()
@@ -322,11 +331,16 @@ _HOLEID_DEPTH_RE2 = re.compile(
 _HOLEID_DEPTH_RE3 = re.compile(
     r"^([A-Za-z]+(?:\s+[A-Za-z]+)*)\s+(\d{3,})-(\d{2,4})$"
 )
+# Lab sample ID: letters + space + digits (hole number) + space + from-to
+# e.g. "PRC 23 500-505" -> hole="PRC 23", from=500, to=505
+_HOLEID_DEPTH_RE4 = re.compile(
+    r"^([A-Za-z]+\s+\d+)\s+(\d{2,})-(\d{2,4})$"
+)
 
 
 def _expand_to_depth(from_val: str, to_suffix: str) -> float:
     """Expand abbreviated To depth using From prefix.
-    '15335', '340' -> 15340.0  (prefix '15' + '340')
+    '15335', '340' → 15340.0  (prefix '15' + '340')
     """
     ns = len(to_suffix)
     if len(from_val) > ns:
@@ -340,7 +354,7 @@ def _try_parse_combined(val: str):
         m = pat.match(s)
         if m:
             return m.group(1), float(m.group(2)), float(m.group(3))
-    # Lab sample ID format: "PRC 15335-340" -> hole=PRC, from=15335, to=15340
+    # Lab sample ID: "PRC 15335-340" -> hole=PRC, from=15335, to=15340
     m = _HOLEID_DEPTH_RE3.match(s)
     if m:
         from_depth = m.group(2)
@@ -348,7 +362,16 @@ def _try_parse_combined(val: str):
         from_val = float(from_depth)
         if to_depth > from_val:
             return m.group(1).strip(), from_val, to_depth
+    # Lab sample ID: "PRC 23 500-505" -> hole="PRC 23", from=500, to=505
+    m = _HOLEID_DEPTH_RE4.match(s)
+    if m:
+        from_depth = m.group(2)
+        to_depth = _expand_to_depth(from_depth, m.group(3))
+        from_val = float(from_depth)
+        if to_depth > from_val:
+            return m.group(1).strip(), from_val, to_depth
     return None
+
 
 def _find_col(df: pd.DataFrame, patterns: list[str]) -> Optional[str]:
     for pat in patterns:
@@ -358,17 +381,24 @@ def _find_col(df: pd.DataFrame, patterns: list[str]) -> Optional[str]:
     return None
 
 
-def _cols_look_like_depth_interval(from_s, to_s):
-    """True if from_s/to_s look like genuine depth-from/to (not grade) columns."""
+def _cols_look_like_depth_interval(from_s: pd.Series, to_s: pd.Series) -> bool:
+    """
+    Sanity-check: in a valid depth interval, To > From for the majority of rows
+    and values should be non-negative and not unreasonably small (> 0.5 ft typical min).
+    """
     f = pd.to_numeric(from_s, errors="coerce").dropna()
     t = pd.to_numeric(to_s,   errors="coerce").dropna()
     if len(f) == 0 or len(t) == 0:
         return False
-    common = f.index.intersection(t.index)
-    if len(common) == 0:
+    # Most To values must exceed corresponding From values
+    common_idx = f.index.intersection(t.index)
+    if len(common_idx) == 0:
         return False
-    frac_ok = (t.loc[common] > f.loc[common]).sum() / len(common)
-    return frac_ok >= 0.6 and float(t.median()) >= 0.5
+    valid = (t.loc[common_idx] > f.loc[common_idx]).sum()
+    frac_valid = valid / len(common_idx)
+    # Also check that median To value is reasonably large (> 0.5 — rules out grade columns)
+    median_to = t.median()
+    return frac_valid >= 0.6 and median_to >= 0.5
 
 
 def parse_hole_depth_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -379,12 +409,11 @@ def parse_hole_depth_columns(df: pd.DataFrame) -> pd.DataFrame:
     from_col = _find_col(df, [r"^from$", r"from_", r"_from", r"depth.?from", r"^start$"])
     to_col   = _find_col(df, [r"^to$",   r"to_",   r"_to",   r"depth.?to",   r"^end$"])
 
-    # Only accept named cols if they actually look like depths
     if from_col and to_col and _cols_look_like_depth_interval(df[from_col], df[to_col]):
         rename = {}
         if hole_col and hole_col != "Hole_ID": rename[hole_col] = "Hole_ID"
-        if from_col != "From": rename[from_col] = "From"
-        if to_col   != "To":   rename[to_col]   = "To"
+        if from_col != "From":    rename[from_col] = "From"
+        if to_col   != "To":      rename[to_col]   = "To"
         df.rename(columns=rename, inplace=True)
         if "Hole_ID" not in df.columns:
             df.insert(0, "Hole_ID", "UNKNOWN")
@@ -412,22 +441,26 @@ def parse_hole_depth_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Hole_ID" not in df.columns:
         df.insert(0, "Hole_ID", "UNKNOWN")
 
-    # Fallback: find two numeric cols that pass the depth sanity check
+    # Fallback: find two numeric columns that look like depth intervals
+    # Only grab columns whose values are plausibly depths (median > 0.5)
     num_cols = [
         c for c in df.columns
         if c not in ("Hole_ID", "From", "To")
         and pd.to_numeric(df[c], errors="coerce").notna().sum() > len(df) * 0.5
     ]
+    # Try every pair in order until we find one that passes the sanity check
     if "From" not in df.columns:
         assigned = False
         for i in range(len(num_cols) - 1):
             for j in range(i + 1, len(num_cols)):
-                if _cols_look_like_depth_interval(df[num_cols[i]], df[num_cols[j]]):
-                    df.rename(columns={num_cols[i]: "From", num_cols[j]: "To"}, inplace=True)
+                ca, cb = num_cols[i], num_cols[j]
+                if _cols_look_like_depth_interval(df[ca], df[cb]):
+                    df.rename(columns={ca: "From", cb: "To"}, inplace=True)
                     assigned = True
                     break
             if assigned:
                 break
+        # Last resort: just take first two (old behaviour) but warn implicitly
         if not assigned and len(num_cols) >= 2:
             df.rename(columns={num_cols[0]: "From", num_cols[1]: "To"}, inplace=True)
 
@@ -627,358 +660,382 @@ def find_best_intervals(
 
 
 # ---------------------------------------------------------------------------
-# 12. Excel formatting helpers
+# 11a. Per-sample value, flags, and interval variant helpers
 # ---------------------------------------------------------------------------
 
-_BLUE_FONT   = Font(color="0070C0", bold=True)
-_HEADER_FONT = Font(bold=True, color="FFFFFF")
-_GREY_FONT   = Font(color="808080", italic=True)
-_DARK_FILL   = PatternFill("solid", fgColor="2F4F4F")
-_LIGHT_FILL  = PatternFill("solid", fgColor="D9E1F2")
-_PINK_FILL   = PatternFill("solid", fgColor="FFD7D7")
-_PARAM_FILL  = PatternFill("solid", fgColor="EBF3FB")
+# Individual-metal cutoffs used for the flag column (●/★/✔).
+# These match the BRS010 example (Au=0.1 g/t, Ag=12 g/t, Pb=1%, Zn=0.8%).
+_DEFAULT_METAL_CUTOFFS: dict[str, float] = {
+    "Au": 0.10,   # g/t
+    "Ag": 12.0,   # g/t
+    "Pb": 1.00,   # %
+    "Zn": 0.80,   # %
+}
+
+
+def compute_sample_value(
+    df: pd.DataFrame,
+    prices: dict[str, float],
+    recovery: float = 0.75,
+) -> pd.Series:
+    """Gross $/tonne value per sample row."""
+    LB = 10_000 / 453.592   # ~22.046 lb/t per 1%
+    value = pd.Series(0.0, index=df.index)
+    for elem, price in prices.items():
+        if elem not in df.columns:
+            continue
+        g = pd.to_numeric(df[elem], errors="coerce").fillna(0.0)
+        if elem in _GT_ELEMENTS:
+            value += g * price / 31.1035
+        else:
+            value += g * LB * price * recovery
+    return value
+
+
+def compute_sample_flags(
+    df: pd.DataFrame,
+    metal_cutoffs: Optional[dict[str, float]] = None,
+) -> pd.Series:
+    """
+    Per-sample flag: '✔' (3+ cutoffs met), '★' (2), '●' (1), '' (0).
+    """
+    if metal_cutoffs is None:
+        metal_cutoffs = _DEFAULT_METAL_CUTOFFS
+    counts = pd.Series(0, index=df.index)
+    for elem, cut in metal_cutoffs.items():
+        if elem in df.columns:
+            g = pd.to_numeric(df[elem], errors="coerce").fillna(0.0)
+            counts += (g >= cut).astype(int)
+    def _sym(n: int) -> str:
+        if n >= 3: return "✔"
+        if n == 2: return "★"
+        if n == 1: return "●"
+        return ""
+    return counts.map(_sym)
+
+
+def _trim_samples(
+    samples: pd.DataFrame,
+    prices: dict[str, float],
+    recovery: float = 0.75,
+) -> pd.DataFrame:
+    """Strip lowest-value end samples to improve average $/t."""
+    s    = samples.reset_index(drop=True).copy()
+    vals = compute_sample_value(s, prices, recovery).reset_index(drop=True)
+    changed = True
+    while len(s) > 2 and changed:
+        changed = False
+        avg  = float(vals.mean())
+        head = float(vals.iloc[0])
+        tail = float(vals.iloc[-1])
+        if head < avg and head <= tail:
+            s, vals = s.iloc[1:].reset_index(drop=True), vals.iloc[1:].reset_index(drop=True)
+            changed = True
+        elif tail < avg:
+            s, vals = s.iloc[:-1].reset_index(drop=True), vals.iloc[:-1].reset_index(drop=True)
+            changed = True
+    return s
+
+
+def _find_core_samples(
+    samples: pd.DataFrame,
+    prices: dict[str, float],
+    recovery: float = 0.75,
+) -> pd.DataFrame:
+    """Consecutive sub-interval with the highest average $/t (min 2 samples)."""
+    s = samples.reset_index(drop=True)
+    n = len(s)
+    if n <= 2:
+        return s
+    vals = compute_sample_value(s, prices, recovery)
+    best_avg, best_slice = -1.0, (0, min(2, n))
+    for i in range(n):
+        for j in range(i + 2, n + 1):
+            avg = float(vals.iloc[i:j].mean())
+            if avg > best_avg:
+                best_avg, best_slice = avg, (i, j)
+    return s.iloc[best_slice[0]:best_slice[1]].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 12. Excel style constants
+# ---------------------------------------------------------------------------
+
 _THIN        = Side(style="thin", color="CCCCCC")
 _THIN_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_DARK_FILL   = PatternFill("solid", fgColor="2F4F4F")
+_BLUE_FILL   = PatternFill("solid", fgColor="D9E1F2")
+_PINK_FILL   = PatternFill("solid", fgColor="FFE0E0")
+_GOLD_FILL   = PatternFill("solid", fgColor="FFF2CC")
+_BOLD_WHITE  = Font(bold=True, color="FFFFFF")
+_BOLD        = Font(bold=True)
+_BOLD_RED    = Font(bold=True, color="C00000")
+_GREY_FONT   = Font(color="808080", italic=True)
+_FMT_2DP     = "0.00"
+_FMT_4DP     = "0.0000"
+_FMT_MONEY   = "#,##0.00"
 
-_FMT_GRADE = "0.0000"
-_FMT_MONEY = '#,##0.00'
-
-
-def _sheet_ref(sheet_name: str, cell_addr: str) -> str:
-    """Build a cross-sheet cell reference safe for names with spaces."""
-    return f"'{sheet_name}'!{cell_addr}"
-
-
-def _build_aueq_formula(
-    param_cells: dict[str, str],
-    elem_col_map: dict[str, str],
-    row: int,
-    results_sheet: str = "Results",
-) -> str:
-    """
-    Build a live Excel AuEq formula for a data row.
-
-    param_cells  : {"Au": "$B$2", "Ag": "$B$3", ..., "recovery": "$B$8"}
-    elem_col_map : {"Au": "D", "Ag": "E", "Pb": "F", "Zn": "G"}
-    row          : 1-based Excel row number
-    """
-    au_ref  = _sheet_ref(results_sheet, param_cells["Au"]) if "Au" in param_cells else "1950"
-    rec_ref = _sheet_ref(results_sheet, param_cells.get("recovery", "$B$99"))
-    LB = "685.94"
-
-    parts = []
-    for elem, col_letter in elem_col_map.items():
-        if elem not in param_cells:
-            continue
-        price_ref = _sheet_ref(results_sheet, param_cells[elem])
-        g = f"IF(ISNUMBER({col_letter}{row}),{col_letter}{row},0)"
-        if elem in _GT_ELEMENTS:
-            parts.append(f"({g}*{price_ref}/{au_ref})")
-        else:
-            parts.append(f"({g}*{LB}*{price_ref}*{rec_ref}/{au_ref})")
-
-    return ("=" + "+".join(parts)) if parts else "=0"
-
-
-def _build_value_formula(
-    param_cells: dict[str, str],
-    elem_col_map: dict[str, str],
-    row: int,
-    results_sheet: str = "Results",
-) -> str:
-    """Build a live $/tonne Excel formula for a data row."""
-    rec_ref = _sheet_ref(results_sheet, param_cells.get("recovery", "$B$99"))
-    LB_VAL  = "22.046"  # 10000 / 453.592
-
-    parts = []
-    for elem, col_letter in elem_col_map.items():
-        if elem not in param_cells:
-            continue
-        price_ref = _sheet_ref(results_sheet, param_cells[elem])
-        g = f"IF(ISNUMBER({col_letter}{row}),{col_letter}{row},0)"
-        if elem in _GT_ELEMENTS:
-            parts.append(f"({g}*{price_ref}/31.1035)")
-        else:
-            parts.append(f"({g}*{LB_VAL}*{price_ref}*{rec_ref})")
-
-    return ("=" + "+".join(parts)) if parts else "=0"
+_R = 18   # column R (right analysis block starts here)
 
 
 # ---------------------------------------------------------------------------
-# 13. Parameters block writer
+# 13. Prices & Cutoffs block (right panel, starts at col _R)
 # ---------------------------------------------------------------------------
 
-def _write_parameters_block(
+def _write_prices_block(
     ws,
     prices: dict[str, float],
     cutoff: float,
+    metal_cutoffs: dict[str, float],
+    recovery: float,
     start_row: int = 1,
-) -> dict[str, str]:
-    """
-    Write the editable Parameters block.
-    Returns {param_name: "$B$n"} addresses for formula use.
-    """
+    start_col: int = _R,
+) -> int:
+    """Write Prices & Cutoffs table. Returns the next available row."""
+    sc = start_col
+    r  = start_row
+
+    _PRICE_UNITS   = {e: "$/troy oz" if e in _GT_ELEMENTS else "$/lb" for e in prices}
+    _CUTOFF_LABELS = {"Au": "g/t", "Ag": "g/t", "Pb": "%", "Zn": "%"}
+
     # Title banner
-    ws.merge_cells(f"A{start_row}:D{start_row}")
-    c = ws[f"A{start_row}"]
-    c.value = "PARAMETERS  -  edit the blue cells to recalculate the workbook"
-    c.font  = Font(bold=True, size=12, color="FFFFFF")
-    c.fill  = _DARK_FILL
+    ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + 3)
+    c = ws.cell(row=r, column=sc, value="PRICES & CUTOFFS")
+    c.font = _BOLD_WHITE
+    c.fill = _DARK_FILL
     c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[start_row].height = 22
-
-    # Sub-header
-    r = start_row + 1
-    for ci, h in enumerate(["Parameter", "Value", "Unit", "Notes"], 1):
-        cell = ws.cell(row=r, column=ci, value=h)
-        cell.font   = Font(bold=True)
-        cell.fill   = _LIGHT_FILL
-        cell.border = _THIN_BORDER
-
+    ws.row_dimensions[r].height = 20
     r += 1
-    param_cells: dict[str, str] = {}
 
-    _PRICE_META = {
-        "Au": ("Au Price",  "USD/troy oz", "Gold spot price"),
-        "Ag": ("Ag Price",  "USD/troy oz", "Silver spot price"),
-        "Pb": ("Pb Price",  "USD/lb",      "Lead spot price"),
-        "Zn": ("Zn Price",  "USD/lb",      "Zinc spot price"),
-        "Cu": ("Cu Price",  "USD/lb",      "Copper spot price"),
-        "Mo": ("Mo Price",  "USD/lb",      "Molybdenum spot price"),
-        "Ni": ("Ni Price",  "USD/lb",      "Nickel spot price"),
-        "Co": ("Co Price",  "USD/lb",      "Cobalt spot price"),
-    }
+    # Column headers
+    for ci, h in enumerate(["Metal", "Price", "Unit", "Cut-off"], sc):
+        cell = ws.cell(row=r, column=ci, value=h)
+        cell.font   = _BOLD
+        cell.fill   = _BLUE_FILL
+        cell.border = _THIN_BORDER
+        cell.alignment = Alignment(horizontal="center")
+    r += 1
 
     for elem, price in prices.items():
-        label, unit, note = _PRICE_META.get(
-            elem, (f"{elem} Price", "USD/unit", f"{elem} spot price")
-        )
-        ws.cell(row=r, column=1).value = label
-        c = ws.cell(row=r, column=2)
-        c.value = price
-        c.font  = _BLUE_FONT
-        c.fill  = _PARAM_FILL
-        ws.cell(row=r, column=3).value = unit
-        ws.cell(row=r, column=4).value = note
-        for ci in range(1, 5):
-            ws.cell(row=r, column=ci).border = _THIN_BORDER
-        param_cells[elem] = f"$B${r}"
+        ws.cell(row=r, column=sc,     value=elem).border = _THIN_BORDER
+        c2 = ws.cell(row=r, column=sc + 1, value=price)
+        c2.number_format = "#,##0.00"
+        c2.border = _THIN_BORDER
+        ws.cell(row=r, column=sc + 2, value=_PRICE_UNITS.get(elem, "")).border = _THIN_BORDER
+        cut = metal_cutoffs.get(elem)
+        unit = _CUTOFF_LABELS.get(elem, "")
+        ws.cell(row=r, column=sc + 3,
+                value=f"{cut} {unit}" if cut is not None else "").border = _THIN_BORDER
         r += 1
-
-    # Cutoff row
-    ws.cell(row=r, column=1).value = "AuEq Cutoff"
-    c = ws.cell(row=r, column=2)
-    c.value = cutoff
-    c.font  = _BLUE_FONT
-    c.fill  = _PARAM_FILL
-    ws.cell(row=r, column=3).value = "g/t AuEq"
-    ws.cell(row=r, column=4).value = "Minimum grade for a qualifying interval"
-    for ci in range(1, 5):
-        ws.cell(row=r, column=ci).border = _THIN_BORDER
-    param_cells["cutoff"] = f"$B${r}"
-    r += 1
 
     # Recovery row
-    ws.cell(row=r, column=1).value = "Base Metal Recovery"
-    c = ws.cell(row=r, column=2)
-    c.value = 0.75
-    c.font  = _BLUE_FONT
-    c.fill  = _PARAM_FILL
-    c.number_format = "0%"
-    ws.cell(row=r, column=3).value = "fraction"
-    ws.cell(row=r, column=4).value = "Assumed metallurgical recovery for Pb, Zn, Cu etc."
-    for ci in range(1, 5):
-        ws.cell(row=r, column=ci).border = _THIN_BORDER
-    param_cells["recovery"] = f"$B${r}"
+    ws.cell(row=r, column=sc,     value="Recovery").border    = _THIN_BORDER
+    cr = ws.cell(row=r, column=sc + 1, value=recovery)
+    cr.number_format = "0%"
+    cr.border = _THIN_BORDER
+    ws.cell(row=r, column=sc + 2, value="").border = _THIN_BORDER
+    ws.cell(row=r, column=sc + 3, value="").border = _THIN_BORDER
+    r += 1
 
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["C"].width = 14
-    ws.column_dimensions["D"].width = 44
+    # AuEq cutoff row
+    ws.cell(row=r, column=sc,     value="AuEq Cutoff").border = _THIN_BORDER
+    cc = ws.cell(row=r, column=sc + 1, value=cutoff)
+    cc.number_format = _FMT_2DP
+    cc.border = _THIN_BORDER
+    ws.cell(row=r, column=sc + 2, value="g/t AuEq").border = _THIN_BORDER
+    ws.cell(row=r, column=sc + 3, value="").border = _THIN_BORDER
+    r += 1
 
-    return param_cells
+    return r + 1  # leave a blank row gap
 
 
 # ---------------------------------------------------------------------------
-# 14. Results sheet
+# 14. Best Intervals summary block
 # ---------------------------------------------------------------------------
 
-def _write_results_sheet(
-    wb: openpyxl.Workbook,
+def _write_summary_block(
+    ws,
+    cleaned_df: pd.DataFrame,
     intervals: pd.DataFrame,
     prices: dict[str, float],
-    cutoff: float,
-    param_cells: dict,
-    sheet_name: str = "Results",
-) -> None:
-    ws = wb.active
-    ws.title = sheet_name
+    recovery: float,
+    start_row: int,
+    start_col: int = _R,
+) -> int:
+    """Write per-hole Best Intervals summary (Full / Trim / Core). Returns next row."""
+    sc = start_col
+    r  = start_row
 
-    # Parameters block (fills param_cells in-place)
-    param_cells.update(
-        _write_parameters_block(ws, prices, cutoff, start_row=1)
-    )
-    param_end = 1 + 1 + len(prices) + 2  # banner + sub-header + prices + cutoff + recovery
-    table_start = param_end + 2
-
-    elem_cols = [e for e in prices if e in intervals.columns]
-
-    # Table header
-    headers = (
-        ["Hole ID", "From (ft)", "To (ft)", "Length (ft)", "Length (m)", "AuEq (g/t)"]
-        + [f"{e} (g/t)" if e in _GT_ELEMENTS else f"{e} (%)" for e in elem_cols]
-        + ["Value ($/t)"]
-    )
-
-    r = table_start
-    for ci, h in enumerate(headers, 1):
-        c = ws.cell(row=r, column=ci, value=h)
-        c.font   = _HEADER_FONT
-        c.fill   = _DARK_FILL
-        c.border = _THIN_BORDER
-        c.alignment = Alignment(horizontal="center", wrap_text=True)
-    ws.row_dimensions[r].height = 30
-
-    aueq_col    = 6
-    elem_start  = 7
-    value_col   = elem_start + len(elem_cols)
-
-    # elem -> column letter map for formula building
-    elem_col_map = {
-        elem: get_column_letter(elem_start + i)
-        for i, elem in enumerate(elem_cols)
-    }
-
+    # Title
+    ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + 8)
+    c = ws.cell(row=r, column=sc, value="BEST INTERVALS SUMMARY")
+    c.font = _BOLD_WHITE
+    c.fill = _DARK_FILL
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[r].height = 20
     r += 1
-    for _, row_data in intervals.iterrows():
-        is_ni = bool(row_data.get("no_intersection", False))
-        ws.cell(row=r, column=1, value=str(row_data["Hole_ID"]))
+
+    # Column headers
+    hdrs = [
+        "Hole ID",
+        "Full: From", "Full: To", "Full $/t",
+        "Trim: From", "Trim: To", "Trim $/t",
+        "Core: From", "Core: To", "Core $/t",
+    ]
+    for ci, h in enumerate(hdrs, sc):
+        cell = ws.cell(row=r, column=ci, value=h)
+        cell.font   = _BOLD
+        cell.fill   = _BLUE_FILL
+        cell.border = _THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    ws.row_dimensions[r].height = 28
+    r += 1
+
+    for _, irow in intervals.iterrows():
+        hole = irow["Hole_ID"]
+        is_ni = bool(irow.get("no_intersection", False))
+        ws.cell(row=r, column=sc, value=str(hole)).border = _THIN_BORDER
 
         if is_ni:
-            last = len(headers)
-            ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=last)
-            mc = ws.cell(row=r, column=2, value="No significant intersections")
+            ws.merge_cells(start_row=r, start_column=sc + 1, end_row=r, end_column=sc + 9)
+            mc = ws.cell(row=r, column=sc + 1, value="No significant intersections")
             mc.font = _GREY_FONT
             mc.alignment = Alignment(horizontal="center")
-            for ci in range(1, last + 1):
+            for ci in range(sc, sc + 10):
                 ws.cell(row=r, column=ci).border = _THIN_BORDER
         else:
-            ws.cell(row=r, column=2, value=row_data.get("From"))
-            ws.cell(row=r, column=3, value=row_data.get("To"))
-            ws.cell(row=r, column=4, value=row_data.get("Length_ft"))
-            ws.cell(row=r, column=5, value=row_data.get("Length_m"))
+            # Grab the Full-interval samples from cleaned_df
+            full_mask = (
+                (cleaned_df["Hole_ID"] == hole) &
+                (pd.to_numeric(cleaned_df["From"], errors="coerce") >= irow["From"]) &
+                (pd.to_numeric(cleaned_df["To"],   errors="coerce") <= irow["To"])
+            )
+            full_samp = cleaned_df[full_mask].sort_values("From").reset_index(drop=True)
 
-            # Live AuEq formula
-            ws.cell(row=r, column=aueq_col,
-                    value=_build_aueq_formula(param_cells, elem_col_map, r, sheet_name)
-                    ).number_format = _FMT_GRADE
+            def _interval_stats(samp):
+                if samp.empty:
+                    return None, None, None
+                frm = float(samp["From"].min())
+                to  = float(samp["To"].max())
+                val = float(compute_sample_value(samp, prices, recovery).mean())
+                return frm, to, val
 
-            # Element grades (static values)
-            for i, elem in enumerate(elem_cols):
-                c = ws.cell(row=r, column=elem_start + i, value=row_data.get(elem))
-                c.number_format = _FMT_GRADE
+            full_f, full_t, full_v   = _interval_stats(full_samp)
+            trim_samp  = _trim_samples(full_samp,  prices, recovery) if not full_samp.empty else full_samp
+            core_samp  = _find_core_samples(full_samp, prices, recovery) if not full_samp.empty else full_samp
+            trim_f, trim_t, trim_v  = _interval_stats(trim_samp)
+            core_f, core_t, core_v  = _interval_stats(core_samp)
 
-            # Live value formula
-            ws.cell(row=r, column=value_col,
-                    value=_build_value_formula(param_cells, elem_col_map, r, sheet_name)
-                    ).number_format = _FMT_MONEY
-
-            for ci in range(1, len(headers) + 1):
-                ws.cell(row=r, column=ci).border = _THIN_BORDER
+            vals = [full_f, full_t, full_v, trim_f, trim_t, trim_v, core_f, core_t, core_v]
+            fmts = [_FMT_2DP, _FMT_2DP, _FMT_MONEY,
+                    _FMT_2DP, _FMT_2DP, _FMT_MONEY,
+                    _FMT_2DP, _FMT_2DP, _FMT_MONEY]
+            for ci, (v, fmt) in enumerate(zip(vals, fmts), sc + 1):
+                cell = ws.cell(row=r, column=ci, value=v)
+                cell.number_format = fmt
+                cell.border = _THIN_BORDER
 
         r += 1
 
-    # Column widths
-    widths = [14, 10, 10, 12, 12, 12] + [12] * len(elem_cols) + [14]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    ws.freeze_panes = ws[f"A{table_start + 1}"]
+    return r + 1  # blank gap row
 
 
 # ---------------------------------------------------------------------------
-# 15. Raw Data sheet
+# 15. Per-hole interval sample table
 # ---------------------------------------------------------------------------
 
-def _write_raw_data_sheet(
-    wb: openpyxl.Workbook,
-    df: pd.DataFrame,
+def _write_interval_table(
+    ws,
+    hole_id: str,
+    full_samp: pd.DataFrame,
     prices: dict[str, float],
-    param_cells: dict[str, str],
-    results_sheet: str = "Results",
-    sheet_name: str = "Raw Data",
-) -> None:
-    ws = wb.create_sheet(title=sheet_name)
+    metal_cutoffs: dict[str, float],
+    recovery: float,
+    start_row: int,
+    start_col: int = _R,
+) -> int:
+    """Write Full / Trim / Core sample breakdown for one hole. Returns next row."""
+    if full_samp.empty:
+        return start_row
 
-    elem_cols = [e for e in prices if e in df.columns]
-    header_labels = (
-        ["Hole ID", "From (ft)", "To (ft)"]
-        + [f"{e} (g/t)" if e in _GT_ELEMENTS else f"{e} (%)" for e in elem_cols]
-        + ["AuEq (g/t)"]
-    )
+    sc = start_col
+    r  = start_row
+    elem_cols = [e for e in prices if e in full_samp.columns]
 
-    for ci, h in enumerate(header_labels, 1):
-        c = ws.cell(row=1, column=ci, value=h)
-        c.font   = _HEADER_FONT
-        c.fill   = _DARK_FILL
-        c.border = _THIN_BORDER
-        c.alignment = Alignment(horizontal="center")
+    trim_samp = _trim_samples(full_samp,    prices, recovery)
+    core_samp = _find_core_samples(full_samp, prices, recovery)
 
-    elem_start = 4
-    elem_col_map = {
-        elem: get_column_letter(elem_start + i)
-        for i, elem in enumerate(elem_cols)
-    }
-    aueq_col_letter = get_column_letter(elem_start + len(elem_cols))
+    # Hole title banner
+    ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + len(elem_cols) + 3)
+    c = ws.cell(row=r, column=sc, value=f"Hole: {hole_id}")
+    c.font  = _BOLD_WHITE
+    c.fill  = PatternFill("solid", fgColor="404040")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[r].height = 18
+    r += 1
 
-    for ri, (_, row_data) in enumerate(df.iterrows(), start=2):
-        ws.cell(row=ri, column=1, value=row_data.get("Hole_ID"))
-        ws.cell(row=ri, column=2, value=row_data.get("From"))
-        ws.cell(row=ri, column=3, value=row_data.get("To"))
-        for ci in range(1, 4):
-            ws.cell(row=ri, column=ci).border = _THIN_BORDER
+    def _write_variant(variant_name: str, samp: pd.DataFrame, fill):
+        nonlocal r
+        if samp.empty:
+            return
 
-        for i, elem in enumerate(elem_cols):
-            c = ws.cell(row=ri, column=elem_start + i,
-                        value=row_data.get(elem))
-            c.number_format = _FMT_GRADE
-            c.border = _THIN_BORDER
+        # Variant header
+        frm_v = float(samp["From"].min())
+        to_v  = float(samp["To"].max())
+        val_v = float(compute_sample_value(samp, prices, recovery).mean())
+        title = f"{variant_name}:  {frm_v:.1f}–{to_v:.1f} ft  |  avg ${val_v:.2f}/t"
 
-        # Live AuEq formula
-        aueq_c = ws.cell(
-            row=ri,
-            column=elem_start + len(elem_cols),
-            value=_build_aueq_formula(param_cells, elem_col_map, ri, results_sheet),
+        ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + len(elem_cols) + 3)
+        th = ws.cell(row=r, column=sc, value=title)
+        th.font  = _BOLD
+        th.fill  = fill
+        th.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[r].height = 16
+        r += 1
+
+        # Column headers
+        hdrs = (
+            ["From", "To"]
+            + [f"{e} (g/t)" if e in _GT_ELEMENTS else f"{e} (%)" for e in elem_cols]
+            + ["$/tonne", "Flag"]
         )
-        aueq_c.number_format = _FMT_GRADE
-        aueq_c.border = _THIN_BORDER
+        for ci, h in enumerate(hdrs, sc):
+            cell = ws.cell(row=r, column=ci, value=h)
+            cell.font   = _BOLD
+            cell.fill   = _BLUE_FILL
+            cell.border = _THIN_BORDER
+            cell.alignment = Alignment(horizontal="center")
+        r += 1
 
-    # Conditional formatting: highlight rows where AuEq >= cutoff
-    last_row   = 1 + len(df)
-    first_col  = "A"
-    cutoff_ref = _sheet_ref(results_sheet, param_cells["cutoff"])
-    cf_range   = f"{first_col}2:{aueq_col_letter}{last_row}"
-    ws.conditional_formatting.add(
-        cf_range,
-        FormulaRule(
-            formula=[f"${aueq_col_letter}2>={cutoff_ref}"],
-            fill=_PINK_FILL,
-        ),
-    )
+        # Sample rows
+        flags = compute_sample_flags(samp, metal_cutoffs)
+        vals  = compute_sample_value(samp, prices, recovery)
+        for idx in samp.index:
+            row_s = samp.loc[idx]
+            ws.cell(row=r, column=sc,     value=row_s.get("From")).border = _THIN_BORDER
+            ws.cell(row=r, column=sc + 1, value=row_s.get("To")).border   = _THIN_BORDER
+            for ei, elem in enumerate(elem_cols):
+                c2 = ws.cell(row=r, column=sc + 2 + ei, value=row_s.get(elem))
+                c2.number_format = _FMT_4DP
+                c2.border = _THIN_BORDER
+            cv = ws.cell(row=r, column=sc + 2 + len(elem_cols), value=vals.get(idx, 0))
+            cv.number_format = _FMT_MONEY
+            cv.border = _THIN_BORDER
+            cf = ws.cell(row=r, column=sc + 3 + len(elem_cols),
+                         value=flags.get(idx, ""))
+            cf.alignment = Alignment(horizontal="center")
+            cf.border = _THIN_BORDER
+            r += 1
 
-    # Column widths
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 10
-    ws.column_dimensions["C"].width = 10
-    for letter in elem_col_map.values():
-        ws.column_dimensions[letter].width = 12
-    ws.column_dimensions[aueq_col_letter].width = 12
+    _write_variant("Full",  full_samp,  PatternFill("solid", fgColor="E8F4E8"))
+    _write_variant("Trim",  trim_samp,  PatternFill("solid", fgColor="FFF9E6"))
+    _write_variant("Core",  core_samp,  PatternFill("solid", fgColor="FFE8E8"))
 
-    ws.freeze_panes = ws["A2"]
+    return r + 1  # blank gap row
 
 
 # ---------------------------------------------------------------------------
-# 16. Main Excel writer
+# 16. Main Excel writer  (BRS010-style single sheet)
 # ---------------------------------------------------------------------------
 
 def write_excel(
@@ -987,19 +1044,122 @@ def write_excel(
     prices: dict[str, float],
     cutoff: float,
     output_path: str | Path,
+    metal_cutoffs: Optional[dict[str, float]] = None,
+    recovery: float = 0.75,
 ) -> Path:
     """
-    Write the full Excel workbook with Results and Raw Data sheets.
-    Returns the output path.
+    Write the BRS010-style single-sheet Excel workbook.
+
+    Layout
+    ------
+    Left  (cols A–I)  : All sample grades + $/t + flag  (one row per sample)
+    Right (cols K+)   : Prices & Cutoffs block
+                        Best Intervals summary (one row per hole)
+                        Per-hole Full / Trim / Core sample tables
     """
     if not hasattr(output_path, "write"):
         output_path = Path(output_path)
-    wb = openpyxl.Workbook()
-    param_cells: dict[str, str] = {}
+    if metal_cutoffs is None:
+        metal_cutoffs = _DEFAULT_METAL_CUTOFFS
 
-    _write_results_sheet(wb, intervals, prices, cutoff, param_cells)
-    _write_raw_data_sheet(wb, cleaned_df, prices, param_cells)
+    wb  = openpyxl.Workbook()
+    ws  = wb.active
+    ws.title = "Assay Results"
 
+    elem_cols = [e for e in prices if e in cleaned_df.columns]
+
+    # -----------------------------------------------------------------------
+    # LEFT SECTION: all-samples grade table  (cols A–I)
+    # -----------------------------------------------------------------------
+    L_HOLE, L_FROM, L_TO = 1, 2, 3
+    l_elem_start = 4                          # D = first element
+    l_val_col    = l_elem_start + len(elem_cols)
+    l_flag_col   = l_val_col + 1
+
+    # Header row 1
+    for ci, h in enumerate(
+        ["Hole ID", "From (ft)", "To (ft)"]
+        + [f"{e} (g/t)" if e in _GT_ELEMENTS else f"{e} (%)" for e in elem_cols]
+        + ["$/tonne", "Flag"],
+        1,
+    ):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font   = _BOLD_WHITE
+        cell.fill   = _DARK_FILL
+        cell.border = _THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    ws.row_dimensions[1].height = 28
+
+    # Data rows
+    sample_flags  = compute_sample_flags(cleaned_df, metal_cutoffs)
+    sample_values = compute_sample_value(cleaned_df, prices, recovery)
+
+    for ri, (idx, srow) in enumerate(cleaned_df.iterrows(), start=2):
+        ws.cell(row=ri, column=L_HOLE, value=srow.get("Hole_ID")).border = _THIN_BORDER
+        ws.cell(row=ri, column=L_FROM, value=srow.get("From")).border    = _THIN_BORDER
+        ws.cell(row=ri, column=L_TO,   value=srow.get("To")).border      = _THIN_BORDER
+        for ei, elem in enumerate(elem_cols):
+            c2 = ws.cell(row=ri, column=l_elem_start + ei, value=srow.get(elem))
+            c2.number_format = _FMT_4DP
+            c2.border = _THIN_BORDER
+        cv = ws.cell(row=ri, column=l_val_col, value=sample_values.get(idx, 0))
+        cv.number_format = _FMT_MONEY
+        cv.border = _THIN_BORDER
+        cf = ws.cell(row=ri, column=l_flag_col, value=sample_flags.get(idx, ""))
+        cf.alignment = Alignment(horizontal="center")
+        cf.border = _THIN_BORDER
+
+    # Left column widths
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 10
+    for i in range(len(elem_cols)):
+        ws.column_dimensions[get_column_letter(l_elem_start + i)].width = 10
+    ws.column_dimensions[get_column_letter(l_val_col)].width   = 12
+    ws.column_dimensions[get_column_letter(l_flag_col)].width  = 7
+
+    # Gap column between left and right sections
+    gap_col = l_flag_col + 1
+    ws.column_dimensions[get_column_letter(gap_col)].width = 4
+
+    # -----------------------------------------------------------------------
+    # RIGHT SECTION  (starting at column K = 11)
+    # -----------------------------------------------------------------------
+    RIGHT_START = max(l_flag_col + 2, 11)    # at least col K
+
+    # -- Prices block --
+    next_r = _write_prices_block(
+        ws, prices, cutoff, metal_cutoffs, recovery,
+        start_row=1, start_col=RIGHT_START,
+    )
+
+    # -- Summary block --
+    next_r = _write_summary_block(
+        ws, cleaned_df, intervals, prices, recovery,
+        start_row=next_r, start_col=RIGHT_START,
+    )
+
+    # -- Per-hole interval tables --
+    for _, irow in intervals.iterrows():
+        if bool(irow.get("no_intersection", False)):
+            continue
+        hole = irow["Hole_ID"]
+        mask = (
+            (cleaned_df["Hole_ID"] == hole) &
+            (pd.to_numeric(cleaned_df["From"], errors="coerce") >= irow["From"]) &
+            (pd.to_numeric(cleaned_df["To"],   errors="coerce") <= irow["To"])
+        )
+        full_samp = cleaned_df[mask].sort_values("From").reset_index(drop=True)
+        next_r = _write_interval_table(
+            ws, hole, full_samp, prices, metal_cutoffs, recovery,
+            start_row=next_r, start_col=RIGHT_START,
+        )
+
+    # Right section column widths
+    for i in range(12):
+        ws.column_dimensions[get_column_letter(RIGHT_START + i)].width = 13
+
+    ws.freeze_panes = ws["A2"]
     wb.save(output_path)
     return output_path
 
@@ -1023,6 +1183,24 @@ def run_pipeline(
 ) -> Path:
     """
     Full pipeline: raw Excel -> cleaned data -> intervals -> output Excel.
+
+    Parameters
+    ----------
+    filepath       : path to input assay Excel file
+    prices         : {"Au": 1950, "Ag": 24, "Pb": 0.95, "Zn": 1.20}
+                     Precious metals in USD/troy oz, base metals in USD/lb
+    cutoff         : AuEq g/t cut-off for qualifying intervals
+    output_path    : where to save the output .xlsx
+    header_row     : override auto-detection (0-based)
+    data_start_row : override auto-detection (0-based)
+    sheet              sheet          : sheet index or name in the input file
+    drop_tolerance : fraction below cutoff allowed inside an interval
+    min_length_ft  : minimum qualifying interval length in feet
+    recovery       : metallurgical recovery for base metals (default 0.75)
+
+    Returns
+    -------
+    Path to the written output file.
     """
     print(f"[1/4] Loading {filepath} ...")
     raw_df = load_raw(filepath, header_row=header_row,
@@ -1047,7 +1225,8 @@ def run_pipeline(
         print("      No holes processed.")
 
     print(f"[4/4] Writing Excel -> {output_path} ...")
-    out = write_excel(cleaned_df, intervals, prices, cutoff, output_path)
+    out = write_excel(cleaned_df, intervals, prices, cutoff, output_path,
+                      recovery=recovery)
     print("      Done.")
     return out
 
@@ -1070,13 +1249,20 @@ if __name__ == "__main__":
         default='{"Au": 1950, "Ag": 24, "Pb": 0.95, "Zn": 1.20}',
         help="JSON dict of metal prices e.g. '{\"Au\":1950,\"Ag\":24}'",
     )
-    parser.add_argument("--cutoff",     type=float, default=0.5)
-    parser.add_argument("--header-row", type=int,   default=None)
-    parser.add_argument("--data-start", type=int,   default=None)
-    parser.add_argument("--sheet",      default="0")
-    parser.add_argument("--drop-tol",   type=float, default=0.5)
-    parser.add_argument("--min-length", type=float, default=10.0)
-    parser.add_argument("--recovery",   type=float, default=0.75)
+    parser.add_argument("--cutoff",     type=float, default=0.5,
+                        help="AuEq g/t cutoff (default 0.5)")
+    parser.add_argument("--header-row", type=int,   default=None,
+                        help="Override header row (0-based)")
+    parser.add_argument("--data-start", type=int,   default=None,
+                        help="Override data start row (0-based)")
+    parser.add_argument("--sheet",      default="0",
+                        help="Sheet index or name (default 0)")
+    parser.add_argument("--drop-tol",   type=float, default=0.5,
+                        help="Drop tolerance fraction (default 0.5)")
+    parser.add_argument("--min-length", type=float, default=10.0,
+                        help="Minimum interval length in feet (default 10)")
+    parser.add_argument("--recovery",   type=float, default=0.75,
+                        help="Base metal metallurgical recovery (default 0.75)")
 
     args = parser.parse_args()
     prices_in = json.loads(args.prices)
