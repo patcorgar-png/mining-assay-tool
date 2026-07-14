@@ -77,6 +77,7 @@ _UNIT_CONVERSIONS: dict[str, float] = {
     "ppm":   0.0001,    # ppm -> % for base metals
     "ppb":   0.0000001,
     "g/t":   1.0,
+    "g/mt":  1.0,       # g/metric tonne = g/t
     "%":     1.0,
 }
 
@@ -316,15 +317,38 @@ _HOLEID_DEPTH_RE  = re.compile(
 _HOLEID_DEPTH_RE2 = re.compile(
     r"^([A-Za-z]{1,6}[-_]?\d+)[-_](\d+\.?\d*)[-_](\d+\.?\d*)$"
 )
+# Lab sample ID: letters-only prefix + space + from_depth (3+ digits) + dash + to_suffix (2-4 digits)
+# e.g. "PRC 15335-340" -> hole=PRC, from=15335, to=15340
+_HOLEID_DEPTH_RE3 = re.compile(
+    r"^([A-Za-z]+(?:\s+[A-Za-z]+)*)\s+(\d{3,})-(\d{2,4})$"
+)
+
+
+def _expand_to_depth(from_val: str, to_suffix: str) -> float:
+    """Expand abbreviated To depth using From prefix.
+    '15335', '340' -> 15340.0  (prefix '15' + '340')
+    """
+    ns = len(to_suffix)
+    if len(from_val) > ns:
+        return float(from_val[:-ns] + to_suffix)
+    return float(to_suffix)
 
 
 def _try_parse_combined(val: str):
+    s = str(val).strip()
     for pat in (_HOLEID_DEPTH_RE, _HOLEID_DEPTH_RE2):
-        m = pat.match(str(val).strip())
+        m = pat.match(s)
         if m:
             return m.group(1), float(m.group(2)), float(m.group(3))
+    # Lab sample ID format: "PRC 15335-340" -> hole=PRC, from=15335, to=15340
+    m = _HOLEID_DEPTH_RE3.match(s)
+    if m:
+        from_depth = m.group(2)
+        to_depth = _expand_to_depth(from_depth, m.group(3))
+        from_val = float(from_depth)
+        if to_depth > from_val:
+            return m.group(1).strip(), from_val, to_depth
     return None
-
 
 def _find_col(df: pd.DataFrame, patterns: list[str]) -> Optional[str]:
     for pat in patterns:
