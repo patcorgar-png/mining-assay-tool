@@ -215,24 +215,23 @@ def clean_detection_limits(value):
 # 5. Unit metadata extraction
 # ---------------------------------------------------------------------------
 
+_UNIT_ALIASES = {u.lower(): u.lower() for u in _UNIT_CONVERSIONS}
+
+# Matches "(ppm)", "(g/t)" OR suffix forms: "Pb_ppm", "Zn ppm"
 _UNIT_RE = re.compile(
-    r"\((" + "|".join(re.escape(u) for u in _UNIT_CONVERSIONS) + r")\)",
+    r"[\(\s_\-](" + "|".join(re.escape(u) for u in _UNIT_CONVERSIONS) + r")[\)\s]?$",
     re.IGNORECASE,
 )
 
 
 def extract_units_from_columns(columns: list[str]) -> dict[str, str]:
-    """Parse units embedded in column headers like 'Au (g/t)' -> {'Au (g/t)': 'g/t'}"""
-    return {
-        col: m.group(1).lower()
-        for col in columns
-        if (m := _UNIT_RE.search(col))
-    }
-
-
-# ---------------------------------------------------------------------------
-# 6. Column-name standardisation
-# ---------------------------------------------------------------------------
+    """Parse units from headers: 'Au (g/t)', 'Pb_ppm', 'Zn ppm', 'Ag (oz/t)'."""
+    result = {}
+    for col in columns:
+        m = _UNIT_RE.search(col)
+        if m:
+            result[col] = m.group(1).lower()
+    return result
 
 def _parse_col_to_element(col: str) -> Optional[str]:
     base = _UNIT_RE.sub("", col).strip().lower()
@@ -335,25 +334,41 @@ def _find_col(df: pd.DataFrame, patterns: list[str]) -> Optional[str]:
     return None
 
 
+def _cols_look_like_depth_interval(from_s, to_s):
+    """True if from_s/to_s look like genuine depth-from/to (not grade) columns."""
+    f = pd.to_numeric(from_s, errors="coerce").dropna()
+    t = pd.to_numeric(to_s,   errors="coerce").dropna()
+    if len(f) == 0 or len(t) == 0:
+        return False
+    common = f.index.intersection(t.index)
+    if len(common) == 0:
+        return False
+    frac_ok = (t.loc[common] > f.loc[common]).sum() / len(common)
+    return frac_ok >= 0.6 and float(t.median()) >= 0.5
+
+
 def parse_hole_depth_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure df has Hole_ID, From, To columns."""
     df = df.copy()
 
-    hole_col = _find_col(df, [r"hole", r"bhid", r"dh.?id", r"drill", r"holeid"])
-    from_col = _find_col(df, [r"^from$", r"from_", r"_from", r"depth.?from", r"start"])
-    to_col   = _find_col(df, [r"^to$",   r"to_",   r"_to",   r"depth.?to",   r"end"])
+    hole_col = _find_col(df, [r"hole", r"bhid", r"dh.?id", r"drill", r"holeid", r"^bh$", r"^dh$"])
+    from_col = _find_col(df, [r"^from$", r"from_", r"_from", r"depth.?from", r"^start$"])
+    to_col   = _find_col(df, [r"^to$",   r"to_",   r"_to",   r"depth.?to",   r"^end$"])
 
-    if hole_col and from_col and to_col:
+    # Only accept named cols if they actually look like depths
+    if from_col and to_col and _cols_look_like_depth_interval(df[from_col], df[to_col]):
         rename = {}
-        if hole_col != "Hole_ID": rename[hole_col] = "Hole_ID"
-        if from_col != "From":    rename[from_col] = "From"
-        if to_col   != "To":      rename[to_col]   = "To"
+        if hole_col and hole_col != "Hole_ID": rename[hole_col] = "Hole_ID"
+        if from_col != "From": rename[from_col] = "From"
+        if to_col   != "To":   rename[to_col]   = "To"
         df.rename(columns=rename, inplace=True)
+        if "Hole_ID" not in df.columns:
+            df.insert(0, "Hole_ID", "UNKNOWN")
         df["From"] = pd.to_numeric(df["From"], errors="coerce")
         df["To"]   = pd.to_numeric(df["To"],   errors="coerce")
         return df
 
-    # Try combined column
+    # Try combined column (e.g. "BRS009 0-1")
     for col in df.columns:
         sample = df[col].dropna().head(10)
         parsed = [_try_parse_combined(v) for v in sample]
@@ -373,13 +388,24 @@ def parse_hole_depth_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Hole_ID" not in df.columns:
         df.insert(0, "Hole_ID", "UNKNOWN")
 
+    # Fallback: find two numeric cols that pass the depth sanity check
     num_cols = [
         c for c in df.columns
-        if c != "Hole_ID"
+        if c not in ("Hole_ID", "From", "To")
         and pd.to_numeric(df[c], errors="coerce").notna().sum() > len(df) * 0.5
     ]
-    if len(num_cols) >= 2 and "From" not in df.columns:
-        df.rename(columns={num_cols[0]: "From", num_cols[1]: "To"}, inplace=True)
+    if "From" not in df.columns:
+        assigned = False
+        for i in range(len(num_cols) - 1):
+            for j in range(i + 1, len(num_cols)):
+                if _cols_look_like_depth_interval(df[num_cols[i]], df[num_cols[j]]):
+                    df.rename(columns={num_cols[i]: "From", num_cols[j]: "To"}, inplace=True)
+                    assigned = True
+                    break
+            if assigned:
+                break
+        if not assigned and len(num_cols) >= 2:
+            df.rename(columns={num_cols[0]: "From", num_cols[1]: "To"}, inplace=True)
 
     df["From"] = pd.to_numeric(df.get("From", pd.Series(dtype=float)), errors="coerce")
     df["To"]   = pd.to_numeric(df.get("To",   pd.Series(dtype=float)), errors="coerce")
