@@ -528,8 +528,10 @@ def compute_aueq_series(
     df: pd.DataFrame,
     prices: dict[str, float],
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> pd.Series:
     """Compute AuEq (g/t) for every sample row using prices dict."""
+    _eff_gt  = _GT_ELEMENTS | (extra_gt_elements or set())
     au_price = prices.get("Au", 1) or 1
     aueq = pd.Series(0.0, index=df.index)
 
@@ -537,7 +539,7 @@ def compute_aueq_series(
         if elem not in df.columns:
             continue
         grade = pd.to_numeric(df[elem], errors="coerce").fillna(0)
-        if elem in _GT_ELEMENTS:
+        if elem in _eff_gt:
             aueq = aueq + grade * price / au_price
         else:
             aueq = aueq + grade * _LB_SCALE * price * recovery / au_price
@@ -556,6 +558,7 @@ def find_best_intervals(
     drop_tolerance: float = 0.5,
     min_length_ft: float = 10.0,
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     Find the best mineralised intervals per hole using a
@@ -574,8 +577,9 @@ def find_best_intervals(
     -------
     DataFrame with qualifying intervals + "No significant intersections" rows.
     """
+    _eff_gt = _GT_ELEMENTS | (extra_gt_elements or set())
     df = df.copy()
-    df["_AuEq"] = compute_aueq_series(df, prices, recovery=recovery)
+    df["_AuEq"] = compute_aueq_series(df, prices, recovery=recovery, extra_gt_elements=extra_gt_elements)
 
     results: list[dict] = []
     elem_cols = [e for e in prices if e in df.columns]
@@ -648,7 +652,7 @@ def find_best_intervals(
                 )) if elem in w.columns else 0.0
                 row[elem] = round(g, 4)
                 price = prices.get(elem, 0)
-                if elem in _GT_ELEMENTS:
+                if elem in _eff_gt:
                     value_pt += g * price / 31.1035
                 else:
                     value_pt += g * lb_val * price * recovery
@@ -677,15 +681,17 @@ def compute_sample_value(
     df: pd.DataFrame,
     prices: dict[str, float],
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> pd.Series:
     """Gross $/tonne value per sample row."""
+    _eff_gt = _GT_ELEMENTS | (extra_gt_elements or set())
     LB = 10_000 / 453.592   # ~22.046 lb/t per 1%
     value = pd.Series(0.0, index=df.index)
     for elem, price in prices.items():
         if elem not in df.columns:
             continue
         g = pd.to_numeric(df[elem], errors="coerce").fillna(0.0)
-        if elem in _GT_ELEMENTS:
+        if elem in _eff_gt:
             value += g * price / 31.1035
         else:
             value += g * LB * price * recovery
@@ -718,10 +724,11 @@ def _trim_samples(
     samples: pd.DataFrame,
     prices: dict[str, float],
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> pd.DataFrame:
     """Strip lowest-value end samples to improve average $/t."""
     s    = samples.reset_index(drop=True).copy()
-    vals = compute_sample_value(s, prices, recovery).reset_index(drop=True)
+    vals = compute_sample_value(s, prices, recovery, extra_gt_elements).reset_index(drop=True)
     changed = True
     while len(s) > 2 and changed:
         changed = False
@@ -741,13 +748,14 @@ def _find_core_samples(
     samples: pd.DataFrame,
     prices: dict[str, float],
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> pd.DataFrame:
     """Consecutive sub-interval with the highest average $/t (min 2 samples)."""
     s = samples.reset_index(drop=True)
     n = len(s)
     if n <= 2:
         return s
-    vals = compute_sample_value(s, prices, recovery)
+    vals = compute_sample_value(s, prices, recovery, extra_gt_elements)
     best_avg, best_slice = -1.0, (0, min(2, n))
     for i in range(n):
         for j in range(i + 2, n + 1):
@@ -790,13 +798,15 @@ def _write_prices_block(
     recovery: float,
     start_row: int = 1,
     start_col: int = _R,
+    extra_gt_elements: Optional[set] = None,
 ) -> int:
     """Write Prices & Cutoffs table. Returns the next available row."""
     sc = start_col
     r  = start_row
 
-    _PRICE_UNITS   = {e: "$/troy oz" if e in _GT_ELEMENTS else "$/lb" for e in prices}
-    _CUTOFF_LABELS = {"Au": "g/t", "Ag": "g/t", "Pb": "%", "Zn": "%"}
+    _eff_gt        = _GT_ELEMENTS | (extra_gt_elements or set())
+    _PRICE_UNITS   = {e: "$/troy oz" if e in _eff_gt else "$/lb" for e in prices}
+    _CUTOFF_LABELS = {e: "g/t" if e in _eff_gt else "%" for e in prices}
 
     # Title banner
     ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + 3)
@@ -861,6 +871,7 @@ def _write_summary_block(
     recovery: float,
     start_row: int,
     start_col: int = _R,
+    extra_gt_elements: Optional[set] = None,
 ) -> int:
     """Write per-hole Best Intervals summary (Full / Trim / Core). Returns next row."""
     sc = start_col
@@ -917,12 +928,12 @@ def _write_summary_block(
                     return None, None, None
                 frm = float(samp["From"].min())
                 to  = float(samp["To"].max())
-                val = float(compute_sample_value(samp, prices, recovery).mean())
+                val = float(compute_sample_value(samp, prices, recovery, extra_gt_elements).mean())
                 return frm, to, val
 
             full_f, full_t, full_v   = _interval_stats(full_samp)
-            trim_samp  = _trim_samples(full_samp,  prices, recovery) if not full_samp.empty else full_samp
-            core_samp  = _find_core_samples(full_samp, prices, recovery) if not full_samp.empty else full_samp
+            trim_samp  = _trim_samples(full_samp,  prices, recovery, extra_gt_elements) if not full_samp.empty else full_samp
+            core_samp  = _find_core_samples(full_samp, prices, recovery, extra_gt_elements) if not full_samp.empty else full_samp
             trim_f, trim_t, trim_v  = _interval_stats(trim_samp)
             core_f, core_t, core_v  = _interval_stats(core_samp)
 
@@ -953,17 +964,19 @@ def _write_interval_table(
     recovery: float,
     start_row: int,
     start_col: int = _R,
+    extra_gt_elements: Optional[set] = None,
 ) -> int:
     """Write Full / Trim / Core sample breakdown for one hole. Returns next row."""
     if full_samp.empty:
         return start_row
 
+    _eff_gt   = _GT_ELEMENTS | (extra_gt_elements or set())
     sc = start_col
     r  = start_row
     elem_cols = [e for e in prices if e in full_samp.columns]
 
-    trim_samp = _trim_samples(full_samp,    prices, recovery)
-    core_samp = _find_core_samples(full_samp, prices, recovery)
+    trim_samp = _trim_samples(full_samp,    prices, recovery, extra_gt_elements)
+    core_samp = _find_core_samples(full_samp, prices, recovery, extra_gt_elements)
 
     # Hole title banner
     ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + len(elem_cols) + 3)
@@ -982,7 +995,7 @@ def _write_interval_table(
         # Variant header
         frm_v = float(samp["From"].min())
         to_v  = float(samp["To"].max())
-        val_v = float(compute_sample_value(samp, prices, recovery).mean())
+        val_v = float(compute_sample_value(samp, prices, recovery, extra_gt_elements).mean())
         title = f"{variant_name}:  {frm_v:.1f}–{to_v:.1f} ft  |  avg ${val_v:.2f}/t"
 
         ws.merge_cells(start_row=r, start_column=sc, end_row=r, end_column=sc + len(elem_cols) + 3)
@@ -996,7 +1009,7 @@ def _write_interval_table(
         # Column headers
         hdrs = (
             ["From", "To"]
-            + [f"{e} (g/t)" if e in _GT_ELEMENTS else f"{e} (%)" for e in elem_cols]
+            + [f"{e} (g/t)" if e in _eff_gt else f"{e} (%)" for e in elem_cols]
             + ["$/tonne", "Flag"]
         )
         for ci, h in enumerate(hdrs, sc):
@@ -1009,7 +1022,7 @@ def _write_interval_table(
 
         # Sample rows
         flags = compute_sample_flags(samp, metal_cutoffs)
-        vals  = compute_sample_value(samp, prices, recovery)
+        vals  = compute_sample_value(samp, prices, recovery, extra_gt_elements)
         for idx in samp.index:
             row_s = samp.loc[idx]
             ws.cell(row=r, column=sc,     value=row_s.get("From")).border = _THIN_BORDER
@@ -1046,6 +1059,7 @@ def write_excel(
     output_path: str | Path,
     metal_cutoffs: Optional[dict[str, float]] = None,
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> Path:
     """
     Write the BRS010-style single-sheet Excel workbook.
@@ -1061,6 +1075,7 @@ def write_excel(
         output_path = Path(output_path)
     if metal_cutoffs is None:
         metal_cutoffs = _DEFAULT_METAL_CUTOFFS
+    _eff_gt = _GT_ELEMENTS | (extra_gt_elements or set())
 
     wb  = openpyxl.Workbook()
     ws  = wb.active
@@ -1079,7 +1094,7 @@ def write_excel(
     # Header row 1
     for ci, h in enumerate(
         ["Hole ID", "From (ft)", "To (ft)"]
-        + [f"{e} (g/t)" if e in _GT_ELEMENTS else f"{e} (%)" for e in elem_cols]
+        + [f"{e} (g/t)" if e in _eff_gt else f"{e} (%)" for e in elem_cols]
         + ["$/tonne", "Flag"],
         1,
     ):
@@ -1092,7 +1107,7 @@ def write_excel(
 
     # Data rows
     sample_flags  = compute_sample_flags(cleaned_df, metal_cutoffs)
-    sample_values = compute_sample_value(cleaned_df, prices, recovery)
+    sample_values = compute_sample_value(cleaned_df, prices, recovery, extra_gt_elements)
 
     for ri, (idx, srow) in enumerate(cleaned_df.iterrows(), start=2):
         ws.cell(row=ri, column=L_HOLE, value=srow.get("Hole_ID")).border = _THIN_BORDER
@@ -1131,12 +1146,14 @@ def write_excel(
     next_r = _write_prices_block(
         ws, prices, cutoff, metal_cutoffs, recovery,
         start_row=1, start_col=RIGHT_START,
+        extra_gt_elements=extra_gt_elements,
     )
 
     # -- Summary block --
     next_r = _write_summary_block(
         ws, cleaned_df, intervals, prices, recovery,
         start_row=next_r, start_col=RIGHT_START,
+        extra_gt_elements=extra_gt_elements,
     )
 
     # -- Per-hole interval tables --
@@ -1153,6 +1170,7 @@ def write_excel(
         next_r = _write_interval_table(
             ws, hole, full_samp, prices, metal_cutoffs, recovery,
             start_row=next_r, start_col=RIGHT_START,
+            extra_gt_elements=extra_gt_elements,
         )
 
     # Right section column widths
@@ -1180,6 +1198,7 @@ def run_pipeline(
     drop_tolerance: float = 0.5,
     min_length_ft: float = 10.0,
     recovery: float = 0.75,
+    extra_gt_elements: Optional[set] = None,
 ) -> Path:
     """
     Full pipeline: raw Excel -> cleaned data -> intervals -> output Excel.
@@ -1217,6 +1236,7 @@ def run_pipeline(
         drop_tolerance=drop_tolerance,
         min_length_ft=min_length_ft,
         recovery=recovery,
+        extra_gt_elements=extra_gt_elements,
     )
     if len(intervals):
         n_qual = int((~intervals["no_intersection"]).sum())
@@ -1226,7 +1246,7 @@ def run_pipeline(
 
     print(f"[4/4] Writing Excel -> {output_path} ...")
     out = write_excel(cleaned_df, intervals, prices, cutoff, output_path,
-                      recovery=recovery)
+                      recovery=recovery, extra_gt_elements=extra_gt_elements)
     print("      Done.")
     return out
 

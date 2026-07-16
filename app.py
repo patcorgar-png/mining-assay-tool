@@ -30,9 +30,11 @@ except ImportError:
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _df_to_excel_bytes(cleaned_df, intervals, prices, cutoff) -> bytes:
+def _df_to_excel_bytes(cleaned_df, intervals, prices, cutoff,
+                        metal_cutoffs=None, extra_gt_elements=None) -> bytes:
     buf = io.BytesIO()
-    write_excel(cleaned_df, intervals, prices, cutoff, buf)
+    write_excel(cleaned_df, intervals, prices, cutoff, buf,
+                metal_cutoffs=metal_cutoffs, extra_gt_elements=extra_gt_elements)
     return buf.getvalue()
 
 
@@ -83,6 +85,26 @@ with st.sidebar:
                                   help="Assumed metallurgical recovery for Pb, Zn, Cu etc.")
 
     st.divider()
+    st.subheader("Custom Metal (optional)")
+    st.caption("Add any element not listed above (e.g. Mo, Co, W, Pt).")
+    with st.expander("➕ Add a custom metal"):
+        custom_symbol = st.text_input(
+            "Element symbol", value="", max_chars=4,
+            help="e.g. Mo, Co, W, Pt, Pd — must match a column header in your file",
+        ).strip().upper()
+        custom_unit = st.radio(
+            "Assay unit", ["% (base metal, $/lb)", "g/t (precious metal, $/troy oz)"],
+            horizontal=True,
+        )
+        custom_is_gt = custom_unit.startswith("g/t")
+        price_label  = "Price ($/troy oz)" if custom_is_gt else "Price ($/lb)"
+        custom_price  = st.number_input(price_label, value=0.0, min_value=0.0, step=0.01, format="%.4f")
+        custom_cutoff = st.number_input(
+            f"Grade cutoff ({'g/t' if custom_is_gt else '%'})", value=0.0, min_value=0.0, step=0.01, format="%.4f",
+            help="If non-zero, this metal contributes to the flag (●/★/✔) system",
+        )
+
+    st.divider()
     st.subheader("Advanced (optional)")
     header_row_override   = st.number_input("Header row override (0-based, -1 = auto)",
                                             value=-1, min_value=-1, step=1)
@@ -96,7 +118,20 @@ prices = {
     "Pb": pb_price, "Zn": zn_price,
     "Cu": cu_price, "Ni": ni_price,
 }
+# Add custom metal if symbol and price are set
+if custom_symbol and custom_price > 0:
+    prices[custom_symbol] = custom_price
+
+# Drop elements with zero price (user doesn't want them)
 prices = {k: v for k, v in prices.items() if v > 0}
+
+# Build extra_gt_elements and metal_cutoffs for custom metal
+extra_gt_elements = {custom_symbol} if (custom_symbol and custom_is_gt and custom_price > 0) else None
+metal_cutoffs = None  # use pipeline defaults + custom
+if custom_symbol and custom_cutoff > 0 and custom_price > 0:
+    from pipeline import _DEFAULT_METAL_CUTOFFS
+    metal_cutoffs = dict(_DEFAULT_METAL_CUTOFFS)
+    metal_cutoffs[custom_symbol] = custom_cutoff
 
 
 # ── main area ──────────────────────────────────────────────────────────────
@@ -121,6 +156,7 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
     tmp.write(uploaded.read())
     tmp_path = tmp.name
 
+# Show available sheets so user can pick the right one
 try:
     import openpyxl as _opx
     _wb = _opx.load_workbook(tmp_path, read_only=True, data_only=True)
@@ -131,7 +167,7 @@ try:
 except Exception:
     sheet_names = []
 
-# ── run pipeline ───────────────────────────────────────────────────────────
+# ── run pipeline on upload ─────────────────────────────────────────────────
 
 hr   = None if header_row_override < 0 else int(header_row_override)
 dsr  = None if data_start_override < 0 else int(data_start_override)
@@ -166,6 +202,9 @@ st.success(
     f"Elements found: {', '.join(elem_found)}"
 )
 
+
+# ── run interval finder whenever prices/cutoff change ─────────────────────
+
 with st.spinner("Finding best intervals…"):
     try:
         intervals = find_best_intervals(
@@ -173,10 +212,14 @@ with st.spinner("Finding best intervals…"):
             drop_tolerance=drop_tol,
             min_length_ft=min_length,
             recovery=recovery,
+            extra_gt_elements=extra_gt_elements,
         )
     except Exception as e:
         st.error(f"Interval finder error: {e}")
         st.stop()
+
+
+# ── results summary ────────────────────────────────────────────────────────
 
 n_holes = len(intervals)
 n_qual  = int((~intervals["no_intersection"]).sum()) if n_holes else 0
@@ -187,6 +230,10 @@ colB.metric("Qualifying Intervals",  n_qual)
 colC.metric("Below Cutoff",          n_holes - n_qual)
 
 st.divider()
+
+
+# ── results table ──────────────────────────────────────────────────────────
+
 st.subheader("Best Intervals")
 
 display_cols = ["Hole_ID", "From", "To", "Length_ft", "Length_m", "AuEq_avg"]
@@ -211,7 +258,7 @@ for c in disp.columns:
 # Now all columns are object dtype — safe to write empty strings
 ni_mask = intervals["no_intersection"].fillna(False).astype(bool)
 for col in disp.columns:
-    if col != "Hole ID":
+    if col in disp.columns and col != "Hole ID":
         disp[col] = disp[col].astype(object)
         disp.loc[ni_mask, col] = ""
 
@@ -226,11 +273,19 @@ styled = (
 )
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
+
+# ── raw data preview ───────────────────────────────────────────────────────
+
 with st.expander("Raw Data Preview (cleaned)", expanded=False):
     preview_cols = ["Hole_ID", "From", "To"] + elem_found
     preview = cleaned_df[[c for c in preview_cols if c in cleaned_df.columns]].copy()
-    preview["AuEq (g/t)"] = compute_aueq_series(cleaned_df, prices, recovery=recovery).round(4)
 
+    # Add computed AuEq column for preview
+    preview["AuEq (g/t)"] = compute_aueq_series(
+        cleaned_df, prices, recovery=recovery, extra_gt_elements=extra_gt_elements
+    ).round(4)
+
+    # Highlight rows above cutoff
     def _highlight_raw(row):
         try:
             if float(row.get("AuEq (g/t)", 0)) >= cutoff:
@@ -242,15 +297,23 @@ with st.expander("Raw Data Preview (cleaned)", expanded=False):
     st.caption(f"{len(preview):,} rows · pink rows ≥ {cutoff} g/t AuEq")
     st.dataframe(
         preview.style.apply(_highlight_raw, axis=1),
-        use_container_width=True, hide_index=True, height=300,
+        use_container_width=True,
+        hide_index=True,
+        height=300,
     )
+
+
+# ── download ───────────────────────────────────────────────────────────────
 
 st.divider()
 st.subheader("Download Results")
 
 with st.spinner("Building Excel workbook…"):
     try:
-        xlsx_bytes = _df_to_excel_bytes(cleaned_df, intervals, prices, cutoff)
+        xlsx_bytes = _df_to_excel_bytes(
+            cleaned_df, intervals, prices, cutoff,
+            metal_cutoffs=metal_cutoffs, extra_gt_elements=extra_gt_elements,
+        )
     except Exception as e:
         st.error(f"Excel generation error: {e}")
         st.stop()
